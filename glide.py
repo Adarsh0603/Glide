@@ -266,6 +266,131 @@ def held_watchdog():
         time.sleep(0.5)
         if held and time.monotonic() - last_seen[0] > HOLD_TIMEOUT:
             release_held()
+        if gamepad["busy"] and time.monotonic() - gamepad["seen"] > PAD_TIMEOUT:
+            pad_release()
+
+
+# ---------------------------------------------------------------- virtual Xbox controller
+# Uses vgamepad: the ViGEmBus driver on Windows, uinput on Linux, nothing on macOS.
+# The controller is plugged in on first use, so games only see it once the phone opens
+# the Controller screen. The phone sends the whole controller state whenever it changes.
+PAD_BITS = 0xF7FF   # every XUSB button bit (0x0800 is unused)
+PAD_TIMEOUT = 2     # seconds without an update while something is held -> let go
+gamepad = {"dev": None, "status": None, "seen": 0.0, "busy": False}
+gamepad_lock = threading.Lock()
+
+
+def pad_open():
+    """Plug in the virtual controller if it isn't yet. Returns "ok" or a message for the phone."""
+    if gamepad["dev"] is None:
+        if platform.system() == "Darwin":
+            gamepad["status"] = "The controller isn't available on macOS."
+            return gamepad["status"]
+        try:
+            import vgamepad
+            gamepad["dev"] = vgamepad.VX360Gamepad()
+            gamepad["status"] = "ok"
+        except ImportError:
+            gamepad["status"] = "Run  pip install vgamepad  on your laptop, then restart Glide."
+        except Exception as e:
+            print("controller error:", repr(e))
+            gamepad["status"] = (DRIVER_MISSING if os.name == "nt"
+                                 else "Glide needs write access to /dev/uinput.")
+    return gamepad["status"]
+
+
+# The ViGEmBus driver installer ships inside the vgamepad package (and so inside Glide.exe).
+DRIVER_MISSING = "The controller driver (ViGEmBus) isn't installed on your laptop."
+driver_job = {"running": False}
+
+
+def driver_installed():
+    if os.name != "nt":
+        return True
+    r = subprocess.run(["sc", "query", "ViGEmBus"], capture_output=True, creationflags=0x08000000)
+    return r.returncode == 0
+
+
+def driver_msi():
+    import importlib.util
+    arch = "x64" if platform.machine().endswith("64") else "x86"
+    rel = os.path.join("win", "vigem", "install", arch, f"ViGEmBusSetup_{arch}.msi")
+    bases = [os.path.join(getattr(sys, "_MEIPASS", ""), "vgamepad")]
+    try:
+        spec = importlib.util.find_spec("vgamepad")
+        if spec and spec.origin:
+            bases.append(os.path.dirname(spec.origin))
+    except (ImportError, ValueError):
+        pass
+    for b in bases:
+        if os.path.isfile(os.path.join(b, rel)):
+            return os.path.join(b, rel)
+    return None
+
+
+def install_driver():
+    """Run the bundled ViGEmBus installer (it asks Windows for admin itself). True if it ends up installed."""
+    msi = driver_msi()
+    if not msi or driver_job["running"]:
+        return False
+    driver_job["running"] = True
+    try:
+        subprocess.run(["msiexec", "/i", msi, "/passive", "/norestart"])
+    finally:
+        driver_job["running"] = False
+    with gamepad_lock:
+        gamepad["status"] = None   # next pad message tries again
+    return driver_installed()
+
+
+def driver_setup():
+    """Windows setup step: offer to install the controller driver if it's missing."""
+    if os.name != "nt" or driver_installed() or not driver_msi():
+        return
+    try:
+        ans = input("\n  Install the controller driver (ViGEmBus) for the phone's Controller tab? [Y/n]: ")
+    except (EOFError, RuntimeError):
+        return
+    if ans.strip().lower() in ("", "y", "yes"):
+        print("  Approve the Windows prompt...")
+        print("  Controller driver installed." if install_driver()
+              else "  Driver not installed. You can install it later from the Controller tab.")
+
+
+def pad_axis(v, lim):
+    """Phone sends -1000..1000 (triggers 0..1000); scale to the controller's range."""
+    try:
+        return max(-lim, min(lim, round(float(v) * lim / 1000)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def pad_set(d):
+    with gamepad_lock:
+        if pad_open() != "ok":
+            return
+        gp = gamepad["dev"]
+        r = gp.report
+        b = d.get("b")
+        r.wButtons = b & PAD_BITS if isinstance(b, int) else 0
+        r.bLeftTrigger = max(0, pad_axis(d.get("lt"), 255))
+        r.bRightTrigger = max(0, pad_axis(d.get("rt"), 255))
+        r.sThumbLX = pad_axis(d.get("lx"), 32767)
+        r.sThumbLY = pad_axis(d.get("ly"), 32767)
+        r.sThumbRX = pad_axis(d.get("rx"), 32767)
+        r.sThumbRY = pad_axis(d.get("ry"), 32767)
+        gp.update()
+        gamepad["busy"] = any((r.wButtons, r.bLeftTrigger, r.bRightTrigger,
+                               r.sThumbLX, r.sThumbLY, r.sThumbRX, r.sThumbRY))
+        gamepad["seen"] = time.monotonic()
+
+
+def pad_release():
+    with gamepad_lock:
+        if gamepad["dev"] is not None and gamepad["busy"]:
+            gamepad["dev"].reset()
+            gamepad["dev"].update()
+            gamepad["busy"] = False
 
 
 def act(a, d):
@@ -323,7 +448,7 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="referrer" content="no-referrer">
 <link rel="manifest" href="/manifest.json?t=__TOKEN__">
 <link rel="icon" href="/icon.svg?t=__TOKEN__">
-<link rel="apple-touch-icon" href="/icon.svg?t=__TOKEN__">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png?t=__TOKEN__">
 <style>
 :root{
   --bg:#0b0d10; --surface:#14171c; --surface2:#1b1f26; --line:#262b34;
@@ -414,8 +539,59 @@ h6{font-size:11.5px;font-weight:600;color:var(--muted);letter-spacing:1px;text-t
 .vol{display:flex;gap:12px;width:100%;max-width:340px}
 .vol .k{flex:1;height:58px}
 
+/* controller (full screen, landscape) */
+#game{position:fixed;inset:0;z-index:8;display:none;background:var(--bg);touch-action:none;
+  padding:max(8px,env(safe-area-inset-top)) max(10px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left))}
+body.game #game{display:block}
+#game button,#game b{background:var(--surface);border:1px solid var(--line);color:var(--muted);font-weight:600;transition:transform .06s}
+#game .on{background:var(--surface2);border-color:var(--accent);color:var(--text);transform:scale(.95)}
+.gpad{height:100%;display:grid;grid-template-columns:1fr auto 1fr;gap:10px}
+.side{position:relative}
+.sh{display:flex;gap:8px;height:46px}
+.sh button{flex:1;border-radius:16px 16px 10px 10px;font-size:13px}
+.stick{position:absolute;--s:min(44vh,21vw);width:var(--s);height:var(--s);border-radius:50%;
+  background:radial-gradient(circle,#ffffff08 0 38%,transparent 39%),var(--surface);border:1px solid var(--line)}
+.side.l .stick{left:2%;top:calc(46px + 6%)}
+.side.r .stick{left:4%;bottom:2%}
+.stick i{position:absolute;left:50%;top:50%;width:46%;height:46%;margin:-23% 0 0 -23%;border-radius:50%;
+  background:linear-gradient(145deg,#2a303b,#1b1f26);border:1px solid #333a46;box-shadow:0 6px 18px #0008;transition:transform .1s}
+.stick.on{border-color:var(--accent)}
+.stick.on i{transition:none;border-color:var(--accent)}
+.dpad{position:absolute;--d:min(38vh,18vw);width:var(--d);height:var(--d);right:4%;bottom:2%}
+.dpad b{position:absolute;border-radius:10px}
+.dpad b:nth-child(1){left:33%;top:0;width:34%;height:40%}
+.dpad b:nth-child(2){left:33%;bottom:0;width:34%;height:40%}
+.dpad b:nth-child(3){top:33%;left:0;width:40%;height:34%}
+.dpad b:nth-child(4){top:33%;right:0;width:40%;height:34%}
+.abxy{position:absolute;--a:min(44vh,20vw);width:var(--a);height:var(--a);right:2%;top:calc(46px + 4%)}
+.abxy button{position:absolute;width:36%;height:36%;border-radius:50%;font-size:18px}
+#game .y{left:32%;top:0;color:#f5c542} #game .a{left:32%;bottom:0;color:#3ddc97}
+#game .x{left:0;top:32%;color:#5b8cff} #game .b{right:0;top:32%;color:#ff5d6c}
+#game .abxy .on{border-color:currentColor}
+.mid{width:min(120px,18vw);display:flex;flex-direction:column;align-items:center;justify-content:space-between;gap:8px;padding:2px 0}
+.gtop{display:flex;align-items:center;gap:10px}
+#gdot{width:10px;height:10px;border-radius:50%;background:var(--bad)}
+#gdot.on{background:var(--good)}
+#game .icon{width:40px;height:40px;border-radius:12px}
+.sys{display:flex;flex-direction:column;align-items:center;gap:10px}
+.sys div{display:flex;gap:10px}
+.sys button{width:40px;height:40px;border-radius:50%;display:grid;place-items:center}
+.sys .guide{width:52px;height:52px}
+.thumbs{display:flex;gap:8px}
+.thumbs button{width:48px;height:36px;border-radius:12px;font-size:12px}
+#rot,#gmsg{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;
+  gap:16px;padding:24px;text-align:center;color:var(--muted);background:var(--bg)}
+#gmsg{background:#0b0d10ee;z-index:1}
+#gmsg.show{display:flex}
+#game [hidden]{display:none}
+#gmsg p{max-width:360px;color:var(--text)}
+#rot svg{width:44px;height:44px;color:var(--accent)}
+#rot div,#gmsg div{display:flex;gap:10px}
+#game #rot .k,#game #gmsg .k{padding:0 22px;height:46px;border-radius:14px;color:var(--text)}
+@media (orientation:portrait){body.game .gpad{display:none} body.game #rot{display:flex}}
+
 /* tab bar */
-nav.tabs{display:grid;grid-template-columns:repeat(3,1fr);margin:0 14px calc(10px + env(safe-area-inset-bottom));
+nav.tabs{display:grid;grid-template-columns:repeat(4,1fr);margin:0 14px calc(10px + env(safe-area-inset-bottom));
   background:var(--surface);border:1px solid var(--line);border-radius:22px;padding:6px}
 .tab{display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 0;border-radius:16px;
   color:var(--muted);font-size:11.5px;transition:.2s}
@@ -521,7 +697,37 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;heigh
   <button class="tab active" data-v="padv"><svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/></svg>Touchpad</button>
   <button class="tab" data-v="keys"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>Keyboard</button>
   <button class="tab" data-v="media"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Media</button>
+  <button class="tab" data-v="game"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="6"/><path d="M6 12h4M8 10v4M15 11h.01M18 13h.01"/></svg>Controller</button>
 </nav>
+
+<!-- CONTROLLER (virtual Xbox controller on the laptop) -->
+<section id="game">
+  <div class="gpad">
+    <div class="side l">
+      <div class="sh grp"><button data-t="lt">LT</button><button data-b="256">LB</button></div>
+      <div class="stick" id="ls"><i></i></div>
+      <div class="dpad" id="dp"><b data-b="1"></b><b data-b="2"></b><b data-b="4"></b><b data-b="8"></b></div>
+    </div>
+    <div class="mid">
+      <div class="gtop"><span id="gdot"></span><button class="icon gexit" aria-label="Close controller"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
+      <div class="sys grp">
+        <button class="guide" data-b="1024" aria-label="Guide"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/></svg></button>
+        <div>
+          <button data-b="32" aria-label="View"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="11" height="11" rx="2"/><path d="M9 20h11V9"/></svg></button>
+          <button data-b="16" aria-label="Menu"><svg viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h14"/></svg></button>
+        </div>
+      </div>
+      <div class="thumbs grp"><button data-b="64">LS</button><button data-b="128">RS</button></div>
+    </div>
+    <div class="side r">
+      <div class="sh grp"><button data-b="512">RB</button><button data-t="rt">RT</button></div>
+      <div class="abxy grp"><button class="y" data-b="32768">Y</button><button class="x" data-b="16384">X</button><button class="b" data-b="8192">B</button><button class="a" data-b="4096">A</button></div>
+      <div class="stick" id="rs"><i></i></div>
+    </div>
+  </div>
+  <div id="rot"><svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 3h4M17 21h-4"/></svg>Turn your phone sideways<div><button class="k gexit">Back</button></div></div>
+  <div id="gmsg"><p></p><div><button class="k" id="gfix" hidden>Install on laptop</button><button class="k" id="gretry">Try again</button><button class="k gexit">Back</button></div></div>
+</section>
 
 <div id="sheet"><div class="panel">
   <div class="grab"></div>
@@ -588,9 +794,9 @@ async function ping() {
     const j = await r.json();
     MAC = j.os === 'Darwin'; MOD = MAC ? 'cmd' : 'ctrl';
     $('#wink').textContent = MAC ? '⌘ Cmd' : 'Win'; $('#altk').textContent = MAC ? '⌥ Opt' : 'Alt';
-    $('#dot').classList.add('on'); $('#host').textContent = 'Connected · ' + j.host;
+    $$('#dot,#gdot').forEach(d => d.classList.add('on')); $('#host').textContent = 'Connected · ' + j.host;
   } catch(e) {
-    $('#dot').classList.remove('on');
+    $$('#dot,#gdot').forEach(d => d.classList.remove('on'));
     $('#host').textContent = MSG[e] || 'Not connected — is the laptop on?';
   }
   clearTimeout(to);
@@ -599,6 +805,7 @@ ping(); setInterval(ping, 3000);
 
 /* ---------- tabs ---------- */
 $$('.tab').forEach(b => b.onclick = () => {
+  if (b.dataset.v === 'game') { openGame(); buzz(5); return; }   // full-screen overlay, not a view
   $$('.tab').forEach(x => x.classList.toggle('active', x === b));
   $$('.view').forEach(v => v.classList.toggle('active', v.id === b.dataset.v));
   if (b.dataset.v !== 'keys') $('#kb').blur();
@@ -745,14 +952,143 @@ kb.addEventListener('keydown', e => {
   if (e.key === 'Enter') { e.preventDefault(); key('enter'); kb.value = ''; prev = ''; }
   else if (e.key === 'Backspace' && kb.value === '') key('backspace');
 });
+
+/* ---------- controller: whole state sent on change, one request in flight ---------- */
+// b = XUSB button bits, lt/rt = 0..1000, sticks = -1000..1000 (y up is positive)
+const G = {b:0, lt:0, rt:0, lx:0, ly:0, rx:0, ry:0};
+const parts = new Map();   // control -> {b, lt, rt} it is pressing
+let gOn = false, gOK = false, gBusy = false, gDirty = false, gLast = 0, latch = {b:0, lt:0, rt:0};
+const gHeld = () => Object.values(G).some(v => v);
+
+async function gFlush() {
+  if (gBusy || !gDirty || !gOK) return;
+  gDirty = false; gBusy = true; gLast = Date.now();
+  // presses that started and ended while a request was in flight still get sent once
+  const o = {a:'pad', ...G, b: G.b | latch.b, lt: Math.max(G.lt, latch.lt), rt: Math.max(G.rt, latch.rt)};
+  const again = o.b !== G.b || o.lt !== G.lt || o.rt !== G.rt;
+  latch = {b:0, lt:0, rt:0};
+  await send(o);
+  gBusy = false; if (again) gDirty = true; gFlush();
+}
+const gPush = () => { gDirty = true; gFlush(); };
+setInterval(() => { if (gOn && gHeld() && Date.now() - gLast > 500) gPush(); }, 250);   // laptop lets go after 2s of silence
+
+function gUpdate() {
+  let b = 0, lt = 0, rt = 0;
+  for (const v of parts.values()) { b |= v.b; lt = Math.max(lt, v.lt); rt = Math.max(rt, v.rt); }
+  const nb = b & ~G.b, nlt = lt && !G.lt, nrt = rt && !G.rt;
+  if (nb || nlt || nrt) buzz(10);
+  latch.b |= nb; if (nlt) latch.lt = lt; if (nrt) latch.rt = rt;
+  G.b = b; G.lt = lt; G.rt = rt; gPush();
+}
+
+const inside = (t, el, pad=6) => { const r = el.getBoundingClientRect();
+  return t.clientX >= r.left-pad && t.clientX <= r.right+pad && t.clientY >= r.top-pad && t.clientY <= r.bottom+pad; };
+const onTouch = (el, f) => ['touchstart','touchmove','touchend','touchcancel'].forEach(n =>
+  el.addEventListener(n, e => { e.preventDefault(); f(e.targetTouches); }, {passive:false}));
+
+// group of buttons: fingers can slide between them and press two at once
+function group(el) {
+  const kids = [...el.querySelectorAll('[data-b],[data-t]')];
+  onTouch(el, ts => {
+    const st = {b:0, lt:0, rt:0};
+    for (const k of kids) {
+      const on = [...ts].some(t => inside(t, k));
+      k.classList.toggle('on', on);
+      if (on) { if (k.dataset.t) st[k.dataset.t] = 1000; else st.b |= +k.dataset.b; }
+    }
+    parts.set(el, st); gUpdate();
+  });
+}
+$$('#game .grp').forEach(group);
+
+// d-pad: direction from the finger's angle, 8-way
+function dpad(el) {
+  const arms = [...el.children];
+  onTouch(el, ts => {
+    const r = el.getBoundingClientRect(); let b = 0;
+    for (const t of ts) {
+      const x = t.clientX - r.left - r.width/2, y = t.clientY - r.top - r.height/2;
+      if (Math.hypot(x, y) < r.width * 0.12) continue;   // dead centre
+      const a = Math.atan2(y, x) * 180 / Math.PI;         // 0 = right, 90 = down
+      if (a > -67.5 && a < 67.5) b |= 8;
+      if (a > 22.5 && a < 157.5) b |= 2;
+      if (a > 112.5 || a < -112.5) b |= 4;
+      if (a > -157.5 && a < -22.5) b |= 1;
+    }
+    arms.forEach(k => k.classList.toggle('on', !!(b & +k.dataset.b)));
+    parts.set(el, {b, lt:0, rt:0}); gUpdate();
+  });
+}
+dpad($('#dp'));
+
+// sticks: full tilt a little inside the rim
+function stick(el, xk, yk) {
+  const knob = el.querySelector('i');
+  onTouch(el, ts => {
+    const t = ts[0], r = el.getBoundingClientRect(), R = r.width / 2 * 0.72;
+    let x = 0, y = 0;
+    if (t) {
+      x = (t.clientX - r.left - r.width/2) / R; y = (t.clientY - r.top - r.height/2) / R;
+      const m = Math.hypot(x, y); if (m > 1) { x /= m; y /= m; }
+      if (!el.classList.contains('on')) buzz(6);
+    }
+    el.classList.toggle('on', !!t);
+    knob.style.transform = `translate(${x*R}px,${y*R}px)`;
+    G[xk] = Math.round(x * 1000); G[yk] = Math.round(-y * 1000); gPush();
+  });
+}
+stick($('#ls'), 'lx', 'ly'); stick($('#rs'), 'rx', 'ry');
+
+function gReset() {   // let go of everything on the laptop
+  parts.clear(); Object.keys(G).forEach(k => G[k] = 0); latch = {b:0, lt:0, rt:0};
+  $$('#game .on').forEach(x => x.classList.remove('on'));
+  $$('.stick i').forEach(k => k.style.transform = '');
+  gPush();
+}
+
+async function gConnect() {
+  const m = $('#gmsg'); gOK = false;
+  try {
+    const r = await post({a:'pad', ...G});
+    const j = await r.json(); gOK = j.pad === 'ok';
+    m.querySelector('p').textContent = j.pad; $('#gfix').hidden = !j.fix;
+  } catch(e) { m.querySelector('p').textContent = 'Not connected — is the laptop on?'; $('#gfix').hidden = true; }
+  m.classList.toggle('show', !gOK);
+}
+$('#gfix').onclick = () => {
+  buzz(5); send({a:'padinstall'}); $('#gfix').hidden = true;
+  $('#gmsg p').textContent = 'Finish the install on your laptop (approve the Windows prompt), then tap Try again.';
+};
+
+function openGame() {
+  gOn = true; document.body.classList.add('game'); $('#kb').blur();
+  const de = document.documentElement;
+  if (de.requestFullscreen) de.requestFullscreen({navigationUI:'hide'})
+    .then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape')).catch(() => {});
+  gConnect();
+}
+function closeGame() {
+  gReset(); gOn = false; document.body.classList.remove('game');
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  try { screen.orientation.unlock(); } catch(e) {}
+  buzz(5);
+}
+$$('.gexit').forEach(b => b.onclick = closeGame);
+$('#gretry').onclick = () => { buzz(5); gConnect(); };
+document.addEventListener('visibilitychange', () => { if (document.hidden && gOn) gReset(); });
 </script></body></html>
 """
+
+# PNG icons for the home screen (iOS ignores SVG). Drawn by icons/make_icons.py; bundled into the exe.
+ICON_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icons")
+ICON_FILES = {"icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"}
 
 ICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
 <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
 <stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#8a6bff"/></linearGradient></defs>
 <rect width="192" height="192" rx="44" fill="#0b0d10"/>
-<path d="M64 42v100l26-24 18 36 20-9-18-35h36z" fill="url(#g)" stroke="url(#g)" stroke-width="6" stroke-linejoin="round"/>
+<path transform="translate(-9 -2)" d="M64 42v100l26-24 18 36 20-9-18-35h36z" fill="url(#g)" stroke="url(#g)" stroke-width="6" stroke-linejoin="round"/>
 </svg>"""
 
 
@@ -801,10 +1137,19 @@ class Handler(BaseHTTPRequestHandler):
                 "name": "Glide", "short_name": "Glide",
                 "start_url": f"/?t={token}", "display": "standalone",
                 "background_color": "#0b0d10", "theme_color": "#0b0d10",
-                "icons": [{"src": f"/icon.svg?t={token}", "sizes": "any", "type": "image/svg+xml"}],
+                "icons": [
+                    {"src": f"/icon-192.png?t={token}", "sizes": "192x192", "type": "image/png"},
+                    {"src": f"/icon-512.png?t={token}", "sizes": "512x512", "type": "image/png"},
+                    {"src": f"/icon-maskable-512.png?t={token}", "sizes": "512x512", "type": "image/png",
+                     "purpose": "maskable"},
+                    {"src": f"/icon.svg?t={token}", "sizes": "any", "type": "image/svg+xml"},
+                ],
             }).encode(), "application/manifest+json")
         elif url.path == "/icon.svg":
             self._reply(200, ICON.encode(), "image/svg+xml")
+        elif url.path.lstrip("/") in ICON_FILES:
+            with open(os.path.join(ICON_DIR, url.path.lstrip("/")), "rb") as f:
+                self._reply(200, f.read(), "image/png")
         elif url.path == "/glide.crt":  # install on the phone to remove the "not secure" warning
             with open(CERT) as f:
                 der = ssl.PEM_cert_to_DER_cert(f.read())
@@ -852,6 +1197,19 @@ class Handler(BaseHTTPRequestHandler):
         last_seen[0] = time.monotonic()  # pings every 3s keep held keys alive
         if a == "ping":
             self._reply(200, json.dumps({"os": platform.system(), "host": hostname()}).encode())
+            return
+        if a == "pad":
+            try:
+                pad_set(d)
+            except Exception as e:
+                print("error:", e)
+            self._reply(200, json.dumps({"pad": gamepad["status"],
+                                         "fix": gamepad["status"] == DRIVER_MISSING and bool(driver_msi())}).encode())
+            return
+        if a == "padinstall":   # the laptop shows the installer + a Windows admin prompt
+            if not driver_job["running"]:
+                threading.Thread(target=install_driver, daemon=True).start()
+            self._reply(204)
             return
         try:
             act(a, d)
@@ -1128,6 +1486,7 @@ NoDisplay=true
         print("  Keep Glide in this folder: login startup runs it from here.")
     if system == "Windows":
         admin_setup(network_check())
+        driver_setup()
     if system == "Darwin":
         print("  Mac: allow Glide in System Settings > Privacy & Security > Accessibility:")
         print(f"       {cmd[0]}")
@@ -1140,6 +1499,7 @@ def setup():
     if os.path.exists(path) and running():
         print("\n  Glide is installed and running.")
         admin_setup(network_check())
+        driver_setup()
         show_link()
     else:
         install()
