@@ -280,22 +280,62 @@ gamepad = {"dev": None, "status": None, "seen": 0.0, "busy": False}
 gamepad_lock = threading.Lock()
 
 
+def log(*args):
+    """Errors from the background server (it has no visible window): ~/.glide/glide.log"""
+    print(*args)
+    try:
+        with open(os.path.join(HOME, "glide.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(map(str, args)) + "\n")
+    except OSError:
+        pass
+
+
+def _patient_attach(vcli):
+    """vgamepad gives up if the new pad isn't attached the instant it's added. When that
+    happens the pad often attaches a moment later anyway and is left behind as a dead
+    controller in an XInput slot, so games read the dead one. Wait for it instead."""
+    check = vcli.vigem_target_is_attached
+    if getattr(check, "patient", False):
+        return
+
+    def wait(dev):
+        for _ in range(60):          # up to 3 s
+            if check(dev):
+                return True
+            time.sleep(0.05)
+        return False
+    wait.patient = True
+    vcli.vigem_target_is_attached = wait
+
+
 def pad_open():
     """Plug in the virtual controller if it isn't yet. Returns "ok" or a message for the phone."""
-    if gamepad["dev"] is None:
-        if platform.system() == "Darwin":
-            gamepad["status"] = "The controller isn't available on macOS."
-            return gamepad["status"]
-        try:
-            import vgamepad
-            gamepad["dev"] = vgamepad.VX360Gamepad()
-            gamepad["status"] = "ok"
-        except ImportError:
-            gamepad["status"] = "Run  pip install vgamepad  on your laptop, then restart Glide."
-        except Exception as e:
-            print("controller error:", repr(e))
-            gamepad["status"] = (DRIVER_MISSING if os.name == "nt"
-                                 else "Glide needs write access to /dev/uinput.")
+    if gamepad["dev"] is not None:
+        return gamepad["status"]
+    if platform.system() == "Darwin":
+        gamepad["status"] = "The controller isn't available on macOS."
+        return gamepad["status"]
+    # a failed attempt can still leave a pad behind: never retry in a tight loop
+    if gamepad["status"] not in (None, "ok") and time.monotonic() - gamepad.get("tried", 0) < 10:
+        return gamepad["status"]
+    gamepad["tried"] = time.monotonic()
+    try:
+        import vgamepad
+        if os.name == "nt":
+            import vgamepad.win.vigem_client as vcli
+            _patient_attach(vcli)
+        gamepad["dev"] = vgamepad.VX360Gamepad()
+        gamepad["status"] = "ok"
+    except ImportError:
+        gamepad["status"] = "Run  pip install vgamepad  on your laptop, then restart Glide."
+    except Exception as e:
+        log("controller error:", repr(e))
+        if os.name != "nt":
+            gamepad["status"] = "Glide needs write access to /dev/uinput."
+        elif not driver_installed():
+            gamepad["status"] = DRIVER_MISSING
+        else:
+            gamepad["status"] = "Couldn't plug in the controller. Restart Glide on your laptop, then try again."
     return gamepad["status"]
 
 
@@ -485,11 +525,11 @@ main{flex:1;position:relative;min-height:0}
 .padwrap{flex:1;display:flex;gap:10px;min-height:0}
 #pad{flex:1;position:relative;overflow:hidden;touch-action:none;border-radius:22px;
   background:
-    radial-gradient(circle at 50% 0%,#5b8cff14,transparent 60%),
-    radial-gradient(#ffffff0d 1.2px,transparent 1.2px) 0 0/22px 22px,
+    radial-gradient(circle at 50% 0%,color-mix(in srgb,var(--accent) 8%,transparent),transparent 60%),
+    radial-gradient(color-mix(in srgb,var(--text) 7%,transparent) 1.2px,transparent 1.2px) 0 0/22px 22px,
     var(--surface);
   border:1px solid var(--line);transition:border-color .2s,box-shadow .2s}
-#pad.drag{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent),0 0 30px #5b8cff33}
+#pad.drag{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent),0 0 30px color-mix(in srgb,var(--accent) 20%,transparent)}
 #hint{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:10px;color:var(--muted);font-size:13px;transition:opacity .6s;pointer-events:none}
 #hint.gone{opacity:0}
@@ -497,7 +537,7 @@ main{flex:1;position:relative;min-height:0}
 #hint kbd{font:600 11px system-ui;background:var(--surface2);border:1px solid var(--line);
   padding:3px 8px;border-radius:7px;color:var(--text)}
 .rip{position:absolute;width:70px;height:70px;margin:-35px 0 0 -35px;border-radius:50%;pointer-events:none;
-  background:radial-gradient(#5b8cff55,#5b8cff00 70%);animation:rip .5s ease-out forwards}
+  background:radial-gradient(color-mix(in srgb,var(--accent) 33%,transparent),transparent 70%);animation:rip .5s ease-out forwards}
 @keyframes rip{from{transform:scale(.3);opacity:1}to{transform:scale(1.6);opacity:0}}
 #strip{width:38px;border-radius:19px;background:var(--surface);border:1px solid var(--line);touch-action:none;
   display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:14px 0;color:var(--muted)}
@@ -534,7 +574,7 @@ h6{font-size:11.5px;font-weight:600;color:var(--muted);letter-spacing:1px;text-t
 .round{width:66px;height:66px;border-radius:50%;background:var(--surface);border:1px solid var(--line);display:grid;place-items:center}
 .round:active{transform:scale(.93)}
 .play{width:96px;height:96px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:0;
-  box-shadow:0 12px 40px #5b8cff44;color:#fff}
+  box-shadow:0 12px 40px color-mix(in srgb,var(--accent) 27%,transparent);color:#fff}
 .play svg{width:34px;height:34px;fill:#fff;stroke:none}
 .vol{display:flex;gap:12px;width:100%;max-width:340px}
 .vol .k{flex:1;height:58px}
@@ -550,11 +590,11 @@ body.game #game{display:block}
 .sh{display:flex;gap:8px;height:46px}
 .sh button{flex:1;border-radius:16px 16px 10px 10px;font-size:13px}
 .stick{position:absolute;--s:min(44vh,21vw);width:var(--s);height:var(--s);border-radius:50%;
-  background:radial-gradient(circle,#ffffff08 0 38%,transparent 39%),var(--surface);border:1px solid var(--line)}
+  background:radial-gradient(circle,color-mix(in srgb,var(--text) 4%,transparent) 0 38%,transparent 39%),var(--surface);border:1px solid var(--line)}
 .side.l .stick{left:2%;top:calc(46px + 6%)}
 .side.r .stick{left:4%;bottom:2%}
 .stick i{position:absolute;left:50%;top:50%;width:46%;height:46%;margin:-23% 0 0 -23%;border-radius:50%;
-  background:linear-gradient(145deg,#2a303b,#1b1f26);border:1px solid #333a46;box-shadow:0 6px 18px #0008;transition:transform .1s}
+  background:linear-gradient(145deg,var(--surface2),var(--surface));border:1px solid var(--line);box-shadow:0 6px 18px #0008;transition:transform .1s}
 .stick.on{border-color:var(--accent)}
 .stick.on i{transition:none;border-color:var(--accent)}
 .dpad{position:absolute;--d:min(38vh,18vw);width:var(--d);height:var(--d);right:4%;bottom:2%}
@@ -581,7 +621,7 @@ body.game #game{display:block}
 .thumbs button{width:48px;height:36px;border-radius:12px;font-size:12px}
 #rot,#gmsg{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:16px;padding:24px;text-align:center;color:var(--muted);background:var(--bg)}
-#gmsg{background:#0b0d10ee;z-index:1}
+#gmsg{background:color-mix(in srgb,var(--bg) 93%,transparent);z-index:1}
 #gmsg.show{display:flex}
 #game [hidden]{display:none}
 #gmsg p{max-width:360px;color:var(--text)}
@@ -616,6 +656,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;heigh
 .sw{width:50px;height:30px;border-radius:15px;background:var(--line);position:relative;transition:.2s;flex:none}
 .sw::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:.2s}
 .sw.on{background:var(--accent)} .sw.on::after{left:23px}
+#themes{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.th{width:30px;height:30px;border-radius:50%;border:2px solid var(--line);flex:none}
+.th.on{outline:2px solid var(--accent);outline-offset:2px}
 </style></head><body>
 
 <header>
@@ -732,6 +775,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;heigh
 <div id="sheet"><div class="panel">
   <div class="grab"></div>
   <h3>Settings</h3>
+  <div class="row"><span>Theme</span><div id="themes"></div></div>
   <div class="row"><span>Pointer speed</span><input type="range" id="s-speed" min="0.5" max="4" step="0.1"></div>
   <div class="row"><span>Scroll speed</span><input type="range" id="s-scroll" min="0.3" max="3" step="0.1"></div>
   <div class="row"><span>Natural scrolling<small>Content follows your fingers</small></span><button class="sw" id="s-natural"></button></div>
@@ -766,13 +810,38 @@ function pair() {
 }
 
 /* ---------- settings (saved on this phone) ---------- */
-const S = Object.assign({speed:1.8, scroll:1, natural:true, haptics:true},
+const S = Object.assign({speed:1.8, scroll:1, natural:true, haptics:true, theme:'midnight'},
   (() => { try { return JSON.parse(store.get('glide') || '{}'); } catch(e) { return {}; } })());
 const save = () => store.set('glide', JSON.stringify(S));
 const buzz = (ms=8) => { if (S.haptics && navigator.vibrate) navigator.vibrate(ms); };
 ['speed','scroll'].forEach(k => { const el = $('#s-'+k); el.value = S[k]; el.oninput = () => { S[k] = +el.value; save(); }; });
 ['natural','haptics'].forEach(k => { const el = $('#s-'+k); el.classList.toggle('on', S[k]);
   el.onclick = () => { S[k] = !S[k]; el.classList.toggle('on', S[k]); save(); buzz(); }; });
+/* ---------- themes: bg, surface, surface2, line, text, muted, accent, accent2 ---------- */
+const THEMES = {
+  midnight: ['#0b0d10','#14171c','#1b1f26','#262b34','#e9edf3','#7d8694','#5b8cff','#8a6bff'],
+  oled:     ['#000000','#0d0e11','#16181c','#23262c','#eef1f5','#7a818c','#5b8cff','#8a6bff'],
+  light:    ['#f2f4f8','#ffffff','#e7ebf2','#d6dce6','#151922','#66707d','#3b6cf6','#7b5cf5'],
+  ocean:    ['#061317','#0c1e24','#122930','#1d3940','#e2f4f6','#6d9198','#22c3d6','#3b82f6'],
+  sunset:   ['#140c0f','#1f1418','#2a1b20','#3a262d','#f6e9ec','#9a7f86','#ff7a59','#ff4f8b'],
+  forest:   ['#0a110d','#121c16','#19271f','#24362b','#e6f2ea','#7a9283','#3ddc97','#2bb3a3'],
+};
+const TVARS = ['bg','surface','surface2','line','text','muted','accent','accent2'];
+function theme(name) {
+  const t = THEMES[name] || THEMES.midnight;
+  TVARS.forEach((v, i) => document.documentElement.style.setProperty('--' + v, t[i]));
+  $('meta[name=theme-color]').content = t[0];
+  $$('.th').forEach(b => b.classList.toggle('on', b.dataset.t === name));
+}
+Object.entries(THEMES).forEach(([n, t]) => {
+  const b = document.createElement('button');
+  b.className = 'th'; b.dataset.t = n; b.title = b.ariaLabel = n[0].toUpperCase() + n.slice(1);
+  b.style.background = `linear-gradient(135deg,${t[6]} 0 50%,${t[0]} 50%)`;
+  b.onclick = () => { S.theme = n; save(); theme(n); buzz(5); };
+  $('#themes').append(b);
+});
+theme(S.theme);
+
 $('#gear').onclick = () => $('#sheet').classList.add('open');
 $('#sheet').onclick = e => { if (e.target.id === 'sheet') $('#sheet').classList.remove('open'); };
 
