@@ -2,8 +2,8 @@
 Glide - control your laptop's mouse & keyboard from your phone's browser.
 
 See README.md for setup. Quick version:
-  pip install pynput cryptography
-  python glide.py --install     start now and at every login
+  Glide.exe                     double-click: installs, starts, shows your link
+  python glide.py --install     same, from source (pip install pynput cryptography)
   python glide.py --link        show your link
 """
 import hashlib
@@ -30,7 +30,8 @@ HOME = os.path.join(os.path.expanduser("~"), ".glide")
 CONFIG = os.path.join(HOME, "config.json")
 CERT = os.path.join(HOME, "cert.pem")
 KEY = os.path.join(HOME, "key.pem")
-SCRIPT = os.path.abspath(__file__)
+FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller-built executable
+SCRIPT = sys.executable if FROZEN else os.path.abspath(__file__)
 APP_ID = "com.glide.server"
 
 MAX_DEVICES = 3              # phones that may pair with one link
@@ -141,24 +142,50 @@ def hostname():
     return socket.gethostname().split(".")[0]
 
 
+PRIVATE_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+
+def cert_ok():
+    """Existing cert has the current hardening (name constraints + serverAuth EKU)?"""
+    try:
+        from cryptography import x509
+    except ImportError:
+        return True  # can't inspect; keep what we have
+    try:
+        with open(CERT, "rb") as f:
+            c = x509.load_pem_x509_certificate(f.read())
+        c.extensions.get_extension_for_class(x509.NameConstraints)
+        c.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
+        return True
+    except (OSError, ValueError, x509.ExtensionNotFound):
+        return False
+
+
 def ensure_cert():
-    """Self-signed certificate, made once and kept in ~/.glide/."""
-    if os.path.exists(CERT) and os.path.exists(KEY):
+    """Self-signed certificate, made once and kept in ~/.glide/.
+    If you install it on your phone as trusted, its name constraints mean it can only ever
+    vouch for private-network addresses and this laptop's name, never real websites."""
+    if os.path.exists(CERT) and os.path.exists(KEY) and cert_ok():
         return
     host, ip = hostname(), local_ip()
     try:
         import datetime
         from cryptography import x509
-        from cryptography.x509.oid import NameOID
+        from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import ec
     except ImportError:
         try:  # fallback: openssl on PATH
             os.makedirs(HOME, exist_ok=True)
+            nets = ",".join(f"permitted;IP:{n.network_address}/{n.netmask}"
+                            for n in map(ipaddress.ip_network, PRIVATE_NETS))
             subprocess.run(
                 ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
                  "-nodes", "-keyout", KEY, "-out", CERT, "-days", "825", "-subj", "/CN=Glide",
-                 "-addext", f"subjectAltName=DNS:{host}.local,DNS:localhost,IP:{ip}"],
+                 "-addext", f"subjectAltName=DNS:{host}.local,DNS:localhost,IP:{ip}",
+                 "-addext", "extendedKeyUsage=serverAuth",
+                 "-addext", f"nameConstraints=critical,permitted;DNS:{host}.local,"
+                            f"permitted;DNS:localhost,{nets}"],
                 check=True, capture_output=True)
             os.chmod(KEY, 0o600)
             return
@@ -166,7 +193,7 @@ def ensure_cert():
             sys.exit("\n  Glide needs a TLS certificate. Run:  pip install cryptography\n")
 
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Glide")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"Glide ({host})")])
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (x509.CertificateBuilder()
             .subject_name(name).issuer_name(name).public_key(key.public_key())
@@ -176,7 +203,12 @@ def ensure_cert():
             .add_extension(x509.SubjectAlternativeName([
                 x509.DNSName(f"{host}.local"), x509.DNSName("localhost"),
                 x509.IPAddress(ipaddress.ip_address(ip))]), critical=False)
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.NameConstraints(
+                permitted_subtrees=[x509.DNSName(f"{host}.local"), x509.DNSName("localhost")]
+                + [x509.IPAddress(ipaddress.ip_network(n)) for n in PRIVATE_NETS],
+                excluded_subtrees=None), critical=True)
             .sign(key, hashes.SHA256()))
     write_private(KEY, key.private_bytes(serialization.Encoding.PEM,
                                          serialization.PrivateFormat.PKCS8,
@@ -214,8 +246,41 @@ def clamp(v, lim):
     return max(-lim, min(lim, int(v)))
 
 
+# Modifiers the phone may hold down (3-finger app switching holds Alt / Cmd).
+HOLDABLE = {KEYS[n] for n in ("alt", "cmd", "ctrl", "shift") if n in KEYS}
+HOLD_TIMEOUT = 6     # seconds without hearing from the phone -> let go (no stuck Alt)
+held = set()
+held_lock = threading.Lock()
+last_seen = [time.monotonic()]
+
+
+def release_held():
+    with held_lock:
+        for k in held:
+            keyboard.release(k)
+        held.clear()
+
+
+def held_watchdog():
+    while True:
+        time.sleep(0.5)
+        if held and time.monotonic() - last_seen[0] > HOLD_TIMEOUT:
+            release_held()
+
+
 def act(a, d):
     btn = Button.right if d.get("b") == "right" else Button.left
+    if a in ("down", "up"):
+        k = to_key(d.get("k"))
+        if k in HOLDABLE:
+            with held_lock:
+                if a == "down":
+                    keyboard.press(k)
+                    held.add(k)
+                else:
+                    keyboard.release(k)
+                    held.discard(k)
+        return
     if a == "move":
         mouse.move(clamp(d["dx"], 5000), clamp(d["dy"], 5000))
     elif a == "click":
@@ -285,14 +350,14 @@ header{display:flex;align-items:center;justify-content:space-between;padding:12p
 
 /* views */
 main{flex:1;position:relative;min-height:0}
-.view{position:absolute;inset:0;padding:4px 14px 10px;display:flex;flex-direction:column;gap:10px;
+.view{position:absolute;inset:0;padding:4px 14px 12px;display:flex;flex-direction:column;gap:12px;
   opacity:0;pointer-events:none;transform:translateY(8px);transition:opacity .2s,transform .2s}
 .view.active{opacity:1;pointer-events:auto;transform:none}
-#ctl>*:not(.padwrap){flex-shrink:0}
-#media{overflow-y:auto}
+#keys,#media{overflow-y:auto}
+#keys>*,#media>*{flex-shrink:0}
 
 /* touchpad */
-.padwrap{flex:1;display:flex;gap:10px;min-height:120px}
+.padwrap{flex:1;display:flex;gap:10px;min-height:0}
 #pad{flex:1;position:relative;overflow:hidden;touch-action:none;border-radius:22px;
   background:
     radial-gradient(circle at 50% 0%,#5b8cff14,transparent 60%),
@@ -314,32 +379,29 @@ main{flex:1;position:relative;min-height:0}
 #strip i{flex:1;width:2px;margin:10px 0;border-radius:2px;
   background:repeating-linear-gradient(var(--line) 0 6px,transparent 6px 12px)}
 #strip.on{border-color:var(--accent);color:var(--accent)}
-.clicks{display:grid;grid-template-columns:1fr 1fr;gap:10px;height:54px}
+.clicks{display:grid;grid-template-columns:1fr 1fr;gap:10px;height:64px}
 .clicks button{border-radius:var(--r);background:var(--surface);border:1px solid var(--line);
   color:var(--muted);font-size:13px;letter-spacing:.5px;text-transform:uppercase;transition:.1s}
 .clicks button:active,.clicks button.on{background:var(--surface2);color:var(--text);transform:scale(.98)}
 
-/* typing bar + extra keys */
-.typebar{display:flex;gap:10px}
-.field{position:relative;flex:1}
-#kb{width:100%;height:48px;padding:0 14px 0 44px;font-size:16px;border-radius:var(--r);border:1px solid var(--line);
+/* keys */
+.field{position:relative}
+#kb{width:100%;padding:16px 16px 16px 46px;font-size:16px;border-radius:var(--r);border:1px solid var(--line);
   background:var(--surface);color:var(--text);outline:none;-webkit-user-select:text;user-select:text}
 #kb:focus{border-color:var(--accent)}
-.field svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--muted)}
-#extra{display:none;flex-direction:column;gap:8px;max-height:38dvh;overflow-y:auto}
-#extra.open{display:flex}
+.field svg{position:absolute;left:15px;top:50%;transform:translateY(-50%);color:var(--muted)}
+h6{font-size:11.5px;font-weight:600;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin:6px 4px -4px}
 .grid{display:grid;gap:8px}
 .g4{grid-template-columns:repeat(4,1fr)}
 .g3{grid-template-columns:repeat(3,1fr)}
-.k{height:44px;border-radius:12px;background:var(--surface);border:1px solid var(--line);font-size:14px;
+.k{height:52px;border-radius:14px;background:var(--surface);border:1px solid var(--line);font-size:14px;
   display:flex;align-items:center;justify-content:center;gap:6px;transition:.08s}
 .k:active{background:var(--surface2);transform:scale(.96)}
 .k small{color:var(--muted);font-size:11px}
 .mod.on{background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent;color:#fff}
-.nav{display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:44px 44px;gap:8px}
+.nav{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:52px 52px;gap:8px}
 .nav .up{grid-column:2;grid-row:1}
 .nav .lf{grid-column:1;grid-row:2}.nav .dn{grid-column:2;grid-row:2}.nav .rt{grid-column:3;grid-row:2}
-.nav .en{grid-column:4;grid-row:1/3;height:auto}
 
 /* media */
 .player{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:34px;min-height:300px}
@@ -353,10 +415,10 @@ main{flex:1;position:relative;min-height:0}
 .vol .k{flex:1;height:58px}
 
 /* tab bar */
-nav.tabs{display:grid;grid-template-columns:repeat(2,1fr);margin:0 14px calc(10px + env(safe-area-inset-bottom));
+nav.tabs{display:grid;grid-template-columns:repeat(3,1fr);margin:0 14px calc(10px + env(safe-area-inset-bottom));
   background:var(--surface);border:1px solid var(--line);border-radius:22px;padding:6px}
-.tab{display:flex;align-items:center;justify-content:center;gap:8px;padding:10px 0;border-radius:16px;
-  color:var(--muted);font-size:13px;transition:.2s}
+.tab{display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 0;border-radius:16px;
+  color:var(--muted);font-size:11.5px;transition:.2s}
 .tab.active{background:var(--surface2);color:var(--text)}
 .tab.active svg{color:var(--accent)}
 
@@ -370,6 +432,8 @@ nav.tabs{display:grid;grid-template-columns:repeat(2,1fr);margin:0 14px calc(10p
 .panel h3{font-size:17px;margin-bottom:12px}
 .row{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid var(--line);gap:16px}
 .row:last-child{border:0}
+a.row{color:inherit;text-decoration:none}
+a.row svg{color:var(--accent);flex:none}
 .row span small{display:block;color:var(--muted);font-size:12px;margin-top:2px}
 input[type=range]{-webkit-appearance:none;appearance:none;width:150px;height:4px;border-radius:2px;background:var(--line)}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:var(--accent);border:3px solid var(--surface)}
@@ -384,50 +448,51 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;heigh
 </header>
 
 <main>
-  <!-- CONTROL: touchpad + keyboard together -->
-  <section class="view active" id="ctl">
+  <!-- TOUCHPAD -->
+  <section class="view active" id="padv">
     <div class="padwrap">
       <div id="pad">
         <div id="hint">
           <div><kbd>Tap</kbd> click</div>
           <div><kbd>2-finger tap</kbd> right-click</div>
           <div><kbd>2-finger drag</kbd> scroll</div>
+          <div><kbd>3-finger swipe</kbd> switch apps</div>
           <div><kbd>Double-tap &amp; drag</kbd> select / move</div>
         </div>
       </div>
       <div id="strip"><svg viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></svg><i></i><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></div>
     </div>
     <div class="clicks"><button id="lc">Left</button><button id="rc">Right</button></div>
+  </section>
 
-    <div class="typebar">
-      <div class="field">
-        <svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
-        <input id="kb" placeholder="Type on your laptop" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send">
-      </div>
-      <button class="icon" id="more" aria-label="More keys"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>
+  <!-- KEYBOARD -->
+  <section class="view" id="keys">
+    <div class="field">
+      <svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
+      <input id="kb" placeholder="Tap to type on your laptop" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send">
     </div>
-
-    <div id="extra">
-      <div class="grid g4">
-        <button class="k mod" data-m="ctrl">Ctrl</button><button class="k mod" data-m="alt" id="altk">Alt</button>
-        <button class="k mod" data-m="shift">Shift</button><button class="k mod" data-m="cmd" id="wink">Win</button>
-      </div>
-      <div class="grid g4">
-        <button class="k" data-k="esc">Esc</button><button class="k" data-k="tab">Tab</button>
-        <button class="k" data-k="delete">Del</button><button class="k" data-k="backspace">⌫</button>
-        <button class="k" data-k="home">Home</button><button class="k" data-k="end">End</button>
-        <button class="k" data-k="page_up">PgUp</button><button class="k" data-k="page_down">PgDn</button>
-      </div>
-      <div class="nav">
-        <button class="k up" data-k="up">↑</button>
-        <button class="k lf" data-k="left">←</button><button class="k dn" data-k="down">↓</button><button class="k rt" data-k="right">→</button>
-        <button class="k en" data-k="enter">⏎</button>
-      </div>
-      <div class="grid g3">
-        <button class="k" data-c="MOD,c">Copy</button><button class="k" data-c="MOD,v">Paste</button><button class="k" data-c="MOD,x">Cut</button>
-        <button class="k" data-c="MOD,z">Undo</button><button class="k" data-c="MOD,a">Select all</button><button class="k" data-c="SWITCH">Switch app</button>
-        <button class="k" data-c="MOD,w">Close tab</button><button class="k" data-c="MOD,t">New tab</button><button class="k" data-c="MOD,f">Find</button>
-      </div>
+    <h6>Modifiers</h6>
+    <div class="grid g4">
+      <button class="k mod" data-m="ctrl">Ctrl</button><button class="k mod" data-m="alt" id="altk">Alt</button>
+      <button class="k mod" data-m="shift">Shift</button><button class="k mod" data-m="cmd" id="wink">Win</button>
+    </div>
+    <h6>Keys</h6>
+    <div class="grid g4">
+      <button class="k" data-k="esc">Esc</button><button class="k" data-k="tab">Tab</button>
+      <button class="k" data-k="delete">Del</button><button class="k" data-k="backspace">⌫</button>
+      <button class="k" data-k="home">Home</button><button class="k" data-k="end">End</button>
+      <button class="k" data-k="page_up">PgUp</button><button class="k" data-k="page_down">PgDn</button>
+    </div>
+    <div class="nav">
+      <button class="k up" data-k="up">↑</button>
+      <button class="k lf" data-k="left">←</button><button class="k dn" data-k="down">↓</button><button class="k rt" data-k="right">→</button>
+    </div>
+    <button class="k" data-k="enter" style="width:100%">Enter ⏎</button>
+    <h6>Shortcuts</h6>
+    <div class="grid g3">
+      <button class="k" data-c="MOD,c">Copy</button><button class="k" data-c="MOD,v">Paste</button><button class="k" data-c="MOD,x">Cut</button>
+      <button class="k" data-c="MOD,z">Undo</button><button class="k" data-c="MOD,a">Select all</button><button class="k" data-c="SWITCH">Switch app</button>
+      <button class="k" data-c="MOD,w">Close tab</button><button class="k" data-c="MOD,t">New tab</button><button class="k" data-c="MOD,f">Find</button>
     </div>
   </section>
 
@@ -453,7 +518,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;heigh
 </main>
 
 <nav class="tabs">
-  <button class="tab active" data-v="ctl"><svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/></svg>Control</button>
+  <button class="tab active" data-v="padv"><svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/></svg>Touchpad</button>
+  <button class="tab" data-v="keys"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>Keyboard</button>
   <button class="tab" data-v="media"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Media</button>
 </nav>
 
@@ -464,6 +530,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;heigh
   <div class="row"><span>Scroll speed</span><input type="range" id="s-scroll" min="0.3" max="3" step="0.1"></div>
   <div class="row"><span>Natural scrolling<small>Content follows your fingers</small></span><button class="sw" id="s-natural"></button></div>
   <div class="row"><span>Vibration<small>Feedback on taps (Android)</small></span><button class="sw" id="s-haptics"></button></div>
+  <a class="row" href="/glide.crt?t=__TOKEN__" download="glide.crt"><span>Remove "not secure" warning<small>Download Glide's certificate, then install it (see README)</small></span><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-5-5m5 5 5-5M5 21h14"/></svg></a>
 </div></div>
 
 <script>
@@ -534,12 +601,9 @@ ping(); setInterval(ping, 3000);
 $$('.tab').forEach(b => b.onclick = () => {
   $$('.tab').forEach(x => x.classList.toggle('active', x === b));
   $$('.view').forEach(v => v.classList.toggle('active', v.id === b.dataset.v));
-  if (b.dataset.v !== 'ctl') $('#kb').blur();
+  if (b.dataset.v !== 'keys') $('#kb').blur();
   buzz(5);
 });
-
-/* keep the phone keyboard open while tapping buttons on the control page */
-$$('#ctl button').forEach(b => b.addEventListener('mousedown', e => e.preventDefault()));
 
 /* ---------- pointer movement (batched, one request in flight) ---------- */
 let ax=0, ay=0, sc=0, busy=false;
@@ -575,6 +639,7 @@ pad.addEventListener('touchmove', e => {
   e.preventDefault();
   const p = avg(e.touches), dx = p.x-last.x, dy = p.y-last.y; last = p;
   moved += Math.abs(dx) + Math.abs(dy);
+  if (maxF >= 3) { if (e.touches.length >= 3) swipe3(dx, dy); return; }  // ignore fingers lifting off
   if (e.touches.length === 1) {
     if (dragArm && !dragging && moved > 6) { dragging = true; sendQ({a:'press'}); pad.classList.add('drag'); buzz(15); }
     const accel = 1 + Math.min(Math.hypot(dx,dy)/12, 2);
@@ -589,9 +654,41 @@ function endTouch(e) {
   e.preventDefault();
   if (e.touches.length) { last = avg(e.touches); return; }
   const quick = Date.now()-start < 250 && moved < 12;
-  if (dragging) { dragging = false; pad.classList.remove('drag'); setTimeout(() => sendQ({a:'release'}), 60); lastTap = 0; }
-  else if (quick) { sendQ({a:'click', b: maxF >= 2 ? 'right' : 'left'}); buzz(); lastTap = maxF === 1 ? Date.now() : 0; }
+  if (g3) { if (g3.held) sendQ({a:'up', k:g3.held}); g3 = null; lastTap = 0; }   // lift = pick the app
+  else if (dragging) { dragging = false; pad.classList.remove('drag'); setTimeout(() => sendQ({a:'release'}), 60); lastTap = 0; }
+  else if (quick && maxF <= 2) { sendQ({a:'click', b: maxF === 2 ? 'right' : 'left'}); buzz(); lastTap = maxF === 1 ? Date.now() : 0; }
   maxF = 0; dragArm = false;
+}
+
+document.addEventListener('visibilitychange', () => {   // phone locked / app left mid-swipe
+  if (document.hidden && g3 && g3.held) { send({a:'up', k:g3.held}); g3 = null; maxF = 0; }
+});
+
+/* 3-finger swipe: left/right = app switcher (Alt+Tab held while fingers stay down),
+   up = Task View / Mission Control, down = desktop / App Exposé */
+let g3 = null;
+const STEP = 70;   // px of sideways swipe per app
+function swipe3(dx, dy) {
+  if (!g3) g3 = {x:0, y:0, axis:null, held:null};
+  g3.x += dx; g3.y += dy;
+  if (!g3.axis) {
+    if (Math.hypot(g3.x, g3.y) < 30) return;
+    g3.axis = Math.abs(g3.x) > Math.abs(g3.y) ? 'h' : 'v';
+    if (g3.axis === 'v') {
+      const up = g3.y < 0;
+      sendQ({a:'hotkey', keys: MAC ? ['ctrl', up ? 'up' : 'down'] : ['cmd', up ? 'tab' : 'd']});
+      buzz(15); return;
+    }
+    g3.held = MAC ? 'cmd' : 'alt';
+    sendQ({a:'down', k:g3.held});
+    g3.x = Math.sign(g3.x) * STEP;   // first step happens right away
+  }
+  if (g3.axis !== 'h') return;
+  while (Math.abs(g3.x) >= STEP) {
+    const right = g3.x > 0;
+    sendQ(right ? {a:'key', k:'tab'} : {a:'hotkey', keys:['shift', 'tab']});
+    g3.x -= Math.sign(g3.x) * STEP; buzz(6);
+  }
 }
 pad.addEventListener('touchend', endTouch, {passive:false});
 pad.addEventListener('touchcancel', endTouch, {passive:false});
@@ -614,7 +711,6 @@ function holdBtn(el, b) {
 holdBtn($('#lc'), 'left'); holdBtn($('#rc'), 'right');
 
 /* ---------- keyboard ---------- */
-$('#more').onclick = () => { const o = $('#extra').classList.toggle('open'); $('#more').classList.toggle('on', o); buzz(5); };
 const mods = new Set();
 const clearMods = () => { mods.clear(); $$('.mod').forEach(m => m.classList.remove('on')); };
 function key(k) {
@@ -709,6 +805,10 @@ class Handler(BaseHTTPRequestHandler):
             }).encode(), "application/manifest+json")
         elif url.path == "/icon.svg":
             self._reply(200, ICON.encode(), "image/svg+xml")
+        elif url.path == "/glide.crt":  # install on the phone to remove the "not secure" warning
+            with open(CERT) as f:
+                der = ssl.PEM_cert_to_DER_cert(f.read())
+            self._reply(200, der, "application/x-x509-ca-cert")
         elif url.path == "/":
             self._reply(200, PAGE.replace("__TOKEN__", token).encode(), "text/html; charset=utf-8")
         else:
@@ -749,6 +849,7 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(401)  # unknown phone -> page re-pairs
             return
 
+        last_seen[0] = time.monotonic()  # pings every 3s keep held keys alive
         if a == "ping":
             self._reply(200, json.dumps({"os": platform.system(), "host": hostname()}).encode())
             return
@@ -760,8 +861,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
+    if os.name == "nt":
+        # On Windows SO_REUSEADDR lets a second copy bind the same port; demand exclusive use
+        allow_reuse_address = False
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
     def handle_error(self, request, client_address):
         pass  # failed TLS handshakes, plain-HTTP probes, dropped phones: ignore
+
+
+def running():
+    """Is something (normally Glide) already listening on our port?"""
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", PORT)) == 0
 
 
 def serve():
@@ -774,6 +890,7 @@ def serve():
         print("  or the old WiFi Mouse is still running.")
         show_link()
         sys.exit(0)
+    threading.Thread(target=held_watchdog, daemon=True).start()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(CERT, KEY)
@@ -808,14 +925,136 @@ def firewall(add=True):
     return ok
 
 
-def firewall_cmd():
+def launch_cmd(*args, windowless=False):
+    """Command that runs Glide: the executable itself, or python + this script."""
+    if FROZEN:
+        return [sys.executable, *args]
+    py = sys.executable
+    if windowless and os.name == "nt":
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")  # no console window
+        py = pyw if os.path.exists(pyw) else py
+    return [py, SCRIPT, *args]
+
+
+def fw_present():
+    return all(subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", f"name={n}"],
+                              capture_output=True).returncode == 0 for n, _, _ in FW_RULES)
+
+
+def ps(command):
+    """Run a PowerShell command without flashing a window. Returns (exit code, stdout)."""
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                       capture_output=True, text=True, creationflags=0x08000000)  # CREATE_NO_WINDOW
+    return r.returncode, r.stdout.strip()
+
+
+def wifi_profile():
+    """Windows: (interface index, category, name) of the network Glide is served on."""
+    if os.name != "nt":
+        return None
+    code, out = ps("$i = (Get-NetIPAddress -IPAddress '" + local_ip() + "' -ErrorAction Stop).InterfaceIndex; "
+                   "$p = Get-NetConnectionProfile -InterfaceIndex $i | Select-Object -First 1; "
+                   "'{0}|{1}|{2}' -f $p.InterfaceIndex, $p.NetworkCategory, $p.Name")
+    parts = out.split("|", 2)
+    if code != 0 or len(parts) != 3 or not parts[0].isdigit():
+        return None
+    return int(parts[0]), parts[1], parts[2]
+
+
+def network_check(interactive=True):
+    """Glide is firewalled on Public networks. If this WiFi is Public, offer to mark it
+    Private. Returns the interface index to change, or None."""
+    p = wifi_profile()
+    if not p or p[1] != "Public":
+        return None
+    idx, _, name = p
+    print(f"\n  Windows has your WiFi '{name}' set to Public, so your phone is blocked.")
+    if not interactive:
+        print("  If it's your home network, double-click Glide (or run --trust-network) to fix it.\n")
+        return None
+    print("  Marking it Private lets your phone connect (Windows also allows file and")
+    print("  printer sharing on Private networks). Only say yes for a network you trust.")
+    try:
+        ans = input("  Is this your home network? Mark it Private [Y/n]: ").strip().lower()
+    except (EOFError, RuntimeError):
+        ans = "n"
+    return idx if ans in ("", "y", "yes") else None
+
+
+def is_admin():
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+def run_elevated(*args):
+    """Run Glide as Administrator (Windows UAC prompt) and wait.
+    Returns its exit code, or None if the prompt was declined."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG), ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p), ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
+                    ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
+
+    exe, *rest = launch_cmd(*args, windowless=True)
+    info = SHELLEXECUTEINFOW(cbSize=ctypes.sizeof(SHELLEXECUTEINFOW), fMask=0x40,  # NOCLOSEPROCESS
+                             lpVerb="runas", lpFile=exe,
+                             lpParameters=" ".join(f'"{a}"' for a in rest), nShow=0)
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+        return None
+    k32 = ctypes.windll.kernel32
+    k32.WaitForSingleObject(info.hProcess, 60000)
+    code = wintypes.DWORD()
+    k32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    k32.CloseHandle(info.hProcess)
+    return code.value
+
+
+def admin_tasks(args):
+    """The part that needs Administrator: firewall rules and/or marking a network Private."""
+    ok = True
+    if "--firewall" in args:
+        ok = firewall(True) and ok
+    for a in args:
+        if a.startswith("--private="):
+            ok = ps(f"Set-NetConnectionProfile -InterfaceIndex {int(a.split('=', 1)[1])} "
+                    "-NetworkCategory Private")[0] == 0 and ok
+    return ok
+
+
+def admin_setup(private_idx=None):
+    """Windows: add firewall rules and mark the network Private, with at most one UAC prompt."""
     if platform.system() != "Windows":
-        print("\n  Only needed on Windows. On Mac/Linux, keep your OS firewall on for public WiFi.\n")
-    elif firewall(True):
-        print("\n  Firewall rules added: Glide allowed on Private networks, blocked on Public.\n")
+        return
+    args = (["--firewall"] if not fw_present() else []) + \
+           ([f"--private={private_idx}"] if private_idx is not None else [])
+    if not args:
+        return
+    if is_admin():
+        ok = admin_tasks(args)
     else:
-        print("\n  Couldn't add firewall rules. Open a terminal as Administrator and run:")
-        print(f"    python \"{SCRIPT}\" --firewall\n")
+        print("\n  Approve the Windows prompt (needs admin, asked once)...")
+        code = run_elevated("--admin", *args)
+        if code is None:
+            print("  Prompt declined. Double-click Glide again to retry.\n")
+            return
+        ok = code == 0
+    if ok:
+        if "--firewall" in args:
+            print("  Firewall set: Glide allowed on Private networks, blocked on Public.")
+        if private_idx is not None:
+            print("  WiFi marked Private. Your phone can connect now.")
+    else:
+        print("  Something failed. Run as Administrator:  "
+              + " ".join(f'"{c}"' for c in launch_cmd("--trust-network")))
 
 
 # ---------------------------------------------------------------- autostart
@@ -848,22 +1087,22 @@ def install():
     config()
     system, path = startup_paths()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    py = sys.executable
+    cmd = launch_cmd("--run", windowless=True)
     if system == "Windows":
-        # pythonw = no console window
-        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
-        if not os.path.exists(pyw):
-            pyw = py
+        # Run(..., 0) = hidden window, so even the console .exe runs invisibly
+        line = " ".join(c if c.startswith("--") else f'""{c}""' for c in cmd)
         with open(path, "w") as f:
-            f.write(f'CreateObject("WScript.Shell").Run """{pyw}"" ""{SCRIPT}""", 0, False\n')
-        subprocess.Popen(["wscript", path])
+            f.write(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n')
+        if not running():
+            subprocess.Popen(["wscript", path])
     elif system == "Darwin":
+        argv = "".join(f"<string>{c}</string>" for c in cmd)
         with open(path, "w") as f:
             f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>{APP_ID}</string>
-  <key>ProgramArguments</key><array><string>{py}</string><string>{SCRIPT}</string></array>
+  <key>ProgramArguments</key><array>{argv}</array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict></plist>
@@ -871,31 +1110,55 @@ def install():
         subprocess.run(["launchctl", "unload", path], capture_output=True)
         subprocess.run(["launchctl", "load", path])
     else:
+        exec_line = " ".join(c if c.startswith("--") else f'"{c}"' for c in cmd)
         with open(path, "w") as f:
             f.write(f"""[Desktop Entry]
 Type=Application
 Name=Glide
-Exec="{py}" "{SCRIPT}"
+Exec={exec_line}
 X-GNOME-Autostart-enabled=true
 NoDisplay=true
 """)
-        subprocess.Popen([py, SCRIPT], start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not running():
+            subprocess.Popen(cmd, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("\n  Installed. Glide is running now and will start at every login.")
     print(f"  (startup entry: {path})")
+    if FROZEN:
+        print("  Keep Glide in this folder: login startup runs it from here.")
     if system == "Windows":
-        firewall_cmd()
+        admin_setup(network_check())
     if system == "Darwin":
-        print("  Mac: allow this Python in System Settings > Privacy & Security > Accessibility:")
-        print(f"       {py}")
+        print("  Mac: allow Glide in System Settings > Privacy & Security > Accessibility:")
+        print(f"       {cmd[0]}")
     show_link()
+
+
+def setup():
+    """What a double-click on the executable does."""
+    _, path = startup_paths()
+    if os.path.exists(path) and running():
+        print("\n  Glide is installed and running.")
+        admin_setup(network_check())
+        show_link()
+    else:
+        install()
+    try:
+        input("  Press Enter to close this window (Glide keeps running)...")
+    except (EOFError, RuntimeError):
+        pass
 
 
 def uninstall():
     system, path = startup_paths()
     if system == "Darwin" and os.path.exists(path):
         subprocess.run(["launchctl", "unload", path], capture_output=True)
-    firewall(False)
+    if system == "Windows":
+        firewall(False)
+        left = any(subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", f"name={n}"],
+                                  capture_output=True).returncode == 0 for n, _, _ in FW_RULES)
+        if left:
+            run_elevated("--firewall-off")  # removing rules needs admin too
     if os.path.exists(path):
         os.remove(path)
         print("\n  Removed from startup. (Restart or log out to stop the running copy.)\n")
@@ -921,13 +1184,23 @@ if __name__ == "__main__":
         install()
     elif "--uninstall" in args:
         uninstall()
+    elif "--admin" in args:
+        sys.exit(0 if admin_tasks(args) else 1)  # elevated child of admin_setup()
     elif "--link" in args:
+        network_check(interactive=False)
         show_link()
+    elif "--trust-network" in args:
+        idx = network_check()
+        if idx is None and fw_present():
+            print("\n  Nothing to fix: this WiFi isn't Public and the firewall rules are in place.\n")
+        admin_setup(idx)
     elif "--reset" in args:
         config(reset=True)
         print("\n  New link created. The old link and all paired phones no longer work.")
         show_link()
-    elif "--firewall" in args:
-        firewall_cmd()
-    else:
+    elif "--firewall-off" in args:
+        firewall(False)
+    elif "--run" in args or not FROZEN:
         serve()
+    else:
+        setup()  # executable double-clicked with no arguments
