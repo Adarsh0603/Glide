@@ -1166,16 +1166,52 @@ def uninstall():
         print("\n  Wasn't installed.\n")
 
 
+def _color_ok():
+    """ANSI colors only on a real terminal (turns them on in the Windows console)."""
+    out = sys.stdout
+    if out is None or not out.isatty() or os.environ.get("NO_COLOR"):
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h, mode = k32.GetStdHandle(-11), ctypes.c_uint32()
+            if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+                return False
+            k32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except (AttributeError, OSError):
+            return False
+    return True
+
+
 def show_link():
     ensure_cert()
     token = config()["token"]
-    print("\n  Your link (open on your phone, then 'Add to Home Screen'):\n")
-    print(f"    https://{local_ip()}:{PORT}/?t={token}")
-    print(f"    https://{hostname()}.local:{PORT}/?t={token}   (name-based, works on most iPhones)\n")
-    print("  Your phone will warn about the certificate once. Check that its SHA-256")
-    print("  fingerprint matches this, then continue:\n")
-    print(f"    {fingerprint()}\n")
-    print("  Keep this link private: it controls your keyboard and mouse.\n")
+    on = _color_ok()
+
+    def c(code, text):
+        return f"\033[{code}m{text}\033[0m" if on else text
+
+    bold, link, dim, warn, step = (lambda t: c("1", t), lambda t: c("1;4;96", t),
+                                   lambda t: c("2", t), lambda t: c("1;93", t),
+                                   lambda t: c("1;30;106", f" {t} "))
+    bar = c("96", "  " + "=" * 62)
+    print(f"\n{bar}\n  {bold('CONNECT YOUR PHONE')}  {dim('(phone and laptop on the same WiFi)')}\n{bar}\n")
+
+    print(f"  {step(1)} {bold('Open this link on your phone:')}\n")
+    print(f"      {link(f'https://{local_ip()}:{PORT}/?t={token}')}\n")
+    print(dim(f"      iPhone alternative: https://{hostname()}.local:{PORT}/?t={token}") + "\n")
+
+    print(f"  {step(2)} {bold('Get past the one-time \"not secure\" warning:')}\n")
+    print("      Android: Advanced > Proceed      iPhone: Show Details > visit this website")
+    print("      First check the certificate's SHA-256 fingerprint is exactly:")
+    print(f"      {warn(fingerprint())}\n")
+
+    print(f"  {step(3)} {bold('Add it to your home screen:')}\n")
+    print(f"      Android (Chrome):  {bold('menu (3 dots) > Add to Home screen')}")
+    print(f"      iPhone (Safari):   {bold('Share > Add to Home Screen')}\n")
+
+    print(f"  {c('1;91', 'Keep this link private:')} it controls your keyboard and mouse.\n")
 
 
 if __name__ == "__main__":
